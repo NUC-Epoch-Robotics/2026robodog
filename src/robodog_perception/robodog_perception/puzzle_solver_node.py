@@ -1,112 +1,143 @@
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Image
 from std_msgs.msg import Int32
-from cv_bridge import CvBridge
 import cv2
 import pytesseract
 import re
-import numpy as np
+import sys
 
 class PuzzleSolverNode(Node):
     def __init__(self):
         super().__init__('puzzle_solver_node')
         
         # Declare parameters
-        self.declare_parameter('image_topic', '/camera/color/image_raw')
         self.declare_parameter('result_topic', '/perception/puzzle_result')
-        self.declare_parameter('enable_debug_window', False)
+        self.declare_parameter('enable_debug_window', True)
+        self.declare_parameter('confirm_threshold', 3) # Number of consecutive identical answers required
+        self.declare_parameter('camera_id', 0) # /dev/video0 by default
         
-        image_topic = self.get_parameter('image_topic').value
-        result_topic = self.get_parameter('result_topic').value
+        self.result_topic = self.get_parameter('result_topic').value
         self.debug_window = self.get_parameter('enable_debug_window').value
+        self.confirm_threshold = self.get_parameter('confirm_threshold').value
+        self.camera_id = self.get_parameter('camera_id').value
 
-        # Initialize CV Bridge
-        self.bridge = CvBridge()
         self.get_logger().info("Using Tesseract OCR (Offline/Lightweight).")
 
-        # Publishers and Subscribers
-        self.image_sub = self.create_subscription(
-            Image,
-            image_topic,
-            self.image_callback,
-            10
-        )
-        self.result_pub = self.create_publisher(Int32, result_topic, 10)
+        # Result Publisher
+        self.result_pub = self.create_publisher(Int32, self.result_topic, 10)
         
-        # State
-        self.puzzle_solved = False
-        self.get_logger().info("Puzzle Solver Node has been started. Waiting for images...")
+        # State tracking for multi-frame confirmation
+        self.last_result = None
+        self.confirm_count = 0
+        
+        # Open Camera directly
+        self.get_logger().info(f"Opening physical camera (ID: {self.camera_id})...")
+        self.cap = cv2.VideoCapture(self.camera_id)
+        if not self.cap.isOpened():
+            self.get_logger().error(f"Failed to open camera /dev/video{self.camera_id}. Check permissions or USB connection.")
+            sys.exit(1)
+
+        # Create a timer to poll the camera instead of a while loop blocking the ROS 2 executor
+        # Setting a sensible FPS for OCR (e.g. 5-10hz is usually enough)
+        self.timer = self.create_timer(0.2, self.timer_callback)
+        self.get_logger().info("Puzzle Solver Started. Polling camera for math equations...")
 
     def solve_equation(self, text):
         """
         Extract math expression from raw text and safely evaluate it.
         Supported operators: +, -, *, /
         """
-        # Remove spaces and find the mathematical expression
         clean_text = text.replace(" ", "").replace("x", "*").replace("X", "*")
         
-        # Regular expression to match simple math equations: e.g., 12+34, 15*3-2
+        # Regex to match simple math equations: e.g., 12+34, 15*3-2
         match = re.search(r'(\d+[\+\-\*\/]\d+(?:[\+\-\*\/]\d+)*)', clean_text)
         
         if match:
             expression = match.group(1)
             try:
-                # Safely evaluate the math expression
-                # Note: eval is generally unsafe, but we restrict it to valid math characters via regex
+                # Safely evaluate
                 result = eval(expression)
                 return int(result), expression
             except Exception as e:
-                self.get_logger().error(f"Failed to evaluate '{expression}': {e}")
                 return None, None
         return None, None
 
-    def image_callback(self, msg):
-        # If we already solved it, we might want to shut down or just ignore
-        if self.puzzle_solved:
+    def timer_callback(self):
+        ret, cv_image = self.cap.read()
+        if not ret:
+            self.get_logger().warn("Failed to capture frame from camera.")
             return
 
-        try:
-            # Convert ROS Image message to OpenCV image
-            cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
-        except Exception as e:
-            self.get_logger().error(f"CV Bridge Error: {e}")
-            return
-
-        # Preprocessing for Tesseract (Grayscale & Thresholding helps a lot)
+        # Preprocessing for Tesseract
         gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
-        # Apply binary thresholding (adjust 127/255 as needed based on screen brightness)
+        # Apply binary thresholding
         _, thresh = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY)
 
-        # Perform OCR using Tesseract (detail level)
-        # --psm 6 assumes a single uniform block of text
-        # -c tessedit_char_whitelist=0123456789+-*/= restricts to math symbols
+        # Draw current confirmation status on the original image if debug window is on
+        status_text = f"Confirmations: {self.confirm_count}/{self.confirm_threshold}"
+        cv2.putText(cv_image, status_text, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+
+        # Perform OCR
         custom_config = r'--psm 6 -c tessedit_char_whitelist=0123456789+-*/='
         text = pytesseract.image_to_string(thresh, config=custom_config)
         
-        # text is a single string containing everything detected
-        # split by newlines if there are multiple lines
         results = [line.strip() for line in text.split('\n') if line.strip()]
         
-        for text in results:
-            value, expression = self.solve_equation(text)
+        for matched_text in results:
+            value, expression = self.solve_equation(matched_text)
             if value is not None:
                 high_score_zone = value % 4
-                self.get_logger().info(f"Detected Expression: {expression} = {value}")
-                self.get_logger().info(f"Target High-Score Zone: {high_score_zone}")
                 
-                # Publish the result
-                msg_out = Int32()
-                msg_out.data = high_score_zone
-                self.result_pub.publish(msg_out)
+                self.get_logger().info(f"Detected: {expression} = {value} -> Zone {high_score_zone}")
                 
-                self.puzzle_solved = True
-                self.get_logger().info("Puzzle solved successfully. Stopping further OCR processing to save compute.")
-                break
+                # Multi-frame confirmation logic
+                if self.last_result == high_score_zone:
+                    self.confirm_count += 1
+                    self.get_logger().info(f"Target matches previous frame. Confidence: {self.confirm_count}/{self.confirm_threshold}")
+                else:
+                    self.get_logger().warn("Result changed or is new. Resetting confidence counter.")
+                    self.last_result = high_score_zone
+                    self.confirm_count = 1
+                
+                # Check if we have gathered enough consecutive confident results
+                if self.confirm_count >= self.confirm_threshold:
+                    self.get_logger().info("==================================================")
+                    self.get_logger().info(f"[SUCCESS] High-Score Zone Confirmed as: {high_score_zone}")
+                    self.get_logger().info(f"[SUCCESS] Mathematical derivation: {expression} = {value}")
+                    self.get_logger().info("==================================================")
+                    
+                    # Publish the absolute confident result
+                    msg_out = Int32()
+                    msg_out.data = high_score_zone
+                    self.result_pub.publish(msg_out)
+                    
+                    # Clean up and shutdown successfully
+                    self.cap.release()
+                    if self.debug_window:
+                        cv2.destroyAllWindows()
+                    self.get_logger().info("Shutting down puzzle solver node successfully to free up system resources.")
+                    
+                    # Use a timer to delay true shutdown slightly so the published message has time to go out over DDS
+                    self.create_timer(1.0, self._delayed_shutdown)
+                    
+                    # Stop the main OCR timer
+                    self.timer.cancel()
+                    
+                break # Only process the first valid equation found per frame
+        else:
+            # If no valid equation was found in the whole frame, optionally reset the counter
+            # depending on if we want strict consecutive or just general accumulation.
+            # Usually for OCR, camera blurring might make a frame miss, so we might NOT want to reset to 0 immediately.
+            # We'll slowly decay it or leave it. Here we leave it to be tolerant to single-frame blur drops.
+            pass
 
-        if self.debug_window:
-            cv2.imshow("Puzzle Solver Debug", cv_image)
+        if self.debug_window and self.cap.isOpened():
+            cv2.imshow("Puzzle Solver Camera Feed", cv_image)
             cv2.waitKey(1)
+
+    def _delayed_shutdown(self):
+        # Exit cleanly
+        sys.exit(0)
 
 def main(args=None):
     rclpy.init(args=args)
@@ -116,8 +147,11 @@ def main(args=None):
     except KeyboardInterrupt:
         node.get_logger().info("Keyboard Interrupt, shutting down.\n")
     finally:
-        node.destroy_node()
+        # Failsafe cleanup
+        if node.cap.isOpened():
+            node.cap.release()
         cv2.destroyAllWindows()
+        node.destroy_node()
         rclpy.shutdown()
 
 if __name__ == '__main__':
