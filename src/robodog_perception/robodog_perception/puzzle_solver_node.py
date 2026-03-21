@@ -4,7 +4,7 @@ from sensor_msgs.msg import Image
 from std_msgs.msg import Int32
 from cv_bridge import CvBridge
 import cv2
-import easyocr
+import pytesseract
 import re
 import numpy as np
 
@@ -21,11 +21,9 @@ class PuzzleSolverNode(Node):
         result_topic = self.get_parameter('result_topic').value
         self.debug_window = self.get_parameter('enable_debug_window').value
 
-        # Initialize CV Bridge and OCR Reader
-        # Using EasyOCR with English language since math equations are numbers and symbols
-        self.get_logger().info("Initializing EasyOCR... (this may take a moment)")
-        self.reader = easyocr.Reader(['en'], gpu=True)
+        # Initialize CV Bridge
         self.bridge = CvBridge()
+        self.get_logger().info("Using Tesseract OCR (Offline/Lightweight).")
 
         # Publishers and Subscribers
         self.image_sub = self.create_subscription(
@@ -75,9 +73,20 @@ class PuzzleSolverNode(Node):
             self.get_logger().error(f"CV Bridge Error: {e}")
             return
 
-        # Perform OCR on the image
-        # detail=0 returns a list of strings instead of bounding boxes
-        results = self.reader.readtext(cv_image, detail=0)
+        # Preprocessing for Tesseract (Grayscale & Thresholding helps a lot)
+        gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
+        # Apply binary thresholding (adjust 127/255 as needed based on screen brightness)
+        _, thresh = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY)
+
+        # Perform OCR using Tesseract (detail level)
+        # --psm 6 assumes a single uniform block of text
+        # -c tessedit_char_whitelist=0123456789+-*/= restricts to math symbols
+        custom_config = r'--psm 6 -c tessedit_char_whitelist=0123456789+-*/='
+        text = pytesseract.image_to_string(thresh, config=custom_config)
+        
+        # text is a single string containing everything detected
+        # split by newlines if there are multiple lines
+        results = [line.strip() for line in text.split('\n') if line.strip()]
         
         for text in results:
             value, expression = self.solve_equation(text)

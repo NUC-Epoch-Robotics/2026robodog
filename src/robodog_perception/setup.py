@@ -11,7 +11,7 @@ setup(
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
     ],
-    install_requires=['setuptools', 'easyocr', 'opencv-python'],
+    install_requires=['setuptools', 'pytesseract', 'opencv-python'],
     zip_safe=True,
     maintainer='robodog',
     maintainer_email='robodog@todo.todo',
