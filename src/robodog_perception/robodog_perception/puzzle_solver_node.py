@@ -85,11 +85,19 @@ class PuzzleSolverNode(Node):
 
         # Preprocessing for Tesseract
         gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
-        # Apply binary thresholding
-        _, thresh = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY)
+        # Apply Otsu's thresholding to handle different brightness levels automatically
+        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+
+        # CRITICAL: Tesseract expects BLACK text on WHITE background!
+        # Your screen shows white text on a black background. We must invert it if necessary.
+        num_white = cv2.countNonZero(thresh)
+        num_black = thresh.size - num_white
+        if num_white < num_black:  # If background is mostly black, invert the colors
+            thresh = cv2.bitwise_not(thresh)
 
         # Perform OCR
-        custom_config = r'--psm 6 -c tessedit_char_whitelist=0123456789+-*/='
+        # Added 'x' and 'X' to whitelist because your screen uses 'x' for multiplication
+        custom_config = r'--psm 6 -c tessedit_char_whitelist=0123456789+-*/=xX'
         text = pytesseract.image_to_string(thresh, config=custom_config)
         
         results = [line.strip() for line in text.split('\n') if line.strip()]
