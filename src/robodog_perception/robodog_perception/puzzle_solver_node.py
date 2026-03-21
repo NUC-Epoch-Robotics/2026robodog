@@ -29,6 +29,7 @@ class PuzzleSolverNode(Node):
         # State tracking for multi-frame confirmation
         self.last_result = None
         self.confirm_count = 0
+        self.frame_count = 0
         
         # Open Camera directly
         self.get_logger().info(f"Opening physical camera (ID: {self.camera_id})...")
@@ -37,10 +38,9 @@ class PuzzleSolverNode(Node):
             self.get_logger().error(f"Failed to open camera /dev/video{self.camera_id}. Check permissions or USB connection.")
             sys.exit(1)
 
-        # Create a timer to poll the camera instead of a while loop blocking the ROS 2 executor
-        # Setting a sensible FPS for OCR (e.g. 5-10hz is usually enough)
-        self.timer = self.create_timer(0.2, self.timer_callback)
-        self.get_logger().info("Puzzle Solver Started. Polling camera for math equations...")
+        # Run timer at ~30Hz (0.033s) for smooth video display
+        self.timer = self.create_timer(0.033, self.timer_callback)
+        self.get_logger().info("Puzzle Solver Started. Displaying camera feed...")
 
     def solve_equation(self, text):
         """
@@ -68,14 +68,25 @@ class PuzzleSolverNode(Node):
             self.get_logger().warn("Failed to capture frame from camera.")
             return
 
-        # Preprocessing for Tesseract
-        gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
-        # Apply binary thresholding
-        _, thresh = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY)
+        self.frame_count += 1
 
         # Draw current confirmation status on the original image if debug window is on
         status_text = f"Confirmations: {self.confirm_count}/{self.confirm_threshold}"
         cv2.putText(cv_image, status_text, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+        
+        # Always display the camera feed smoothly at 30fps
+        if self.debug_window and self.cap.isOpened():
+            cv2.imshow("Puzzle Solver Camera Feed", cv_image)
+            cv2.waitKey(1)
+
+        # Only run expensive OCR every 15 frames (~2Hz)
+        if self.frame_count % 15 != 0:
+            return
+
+        # Preprocessing for Tesseract
+        gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
+        # Apply binary thresholding
+        _, thresh = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY)
 
         # Perform OCR
         custom_config = r'--psm 6 -c tessedit_char_whitelist=0123456789+-*/='
@@ -111,29 +122,14 @@ class PuzzleSolverNode(Node):
                     msg_out.data = high_score_zone
                     self.result_pub.publish(msg_out)
                     
-                    # Clean up and shutdown successfully
-                    self.cap.release()
-                    if self.debug_window:
-                        cv2.destroyAllWindows()
-                    self.get_logger().info("Shutting down puzzle solver node successfully to free up system resources.")
-                    
-                    # Use a timer to delay true shutdown slightly so the published message has time to go out over DDS
-                    self.create_timer(1.0, self._delayed_shutdown)
-                    
                     # Stop the main OCR timer
                     self.timer.cancel()
+
+                    # Clean up and shutdown successfully
+                    self.get_logger().info("Shutting down puzzle solver node successfully.")
+                    self.create_timer(1.0, self._delayed_shutdown)
                     
                 break # Only process the first valid equation found per frame
-        else:
-            # If no valid equation was found in the whole frame, optionally reset the counter
-            # depending on if we want strict consecutive or just general accumulation.
-            # Usually for OCR, camera blurring might make a frame miss, so we might NOT want to reset to 0 immediately.
-            # We'll slowly decay it or leave it. Here we leave it to be tolerant to single-frame blur drops.
-            pass
-
-        if self.debug_window and self.cap.isOpened():
-            cv2.imshow("Puzzle Solver Camera Feed", cv_image)
-            cv2.waitKey(1)
 
     def _delayed_shutdown(self):
         # Exit cleanly
