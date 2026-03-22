@@ -151,21 +151,30 @@ class PuzzleSolverNode(Node):
                 # Only run expensive OCR every 15 frames (~2Hz)
                 if self.frame_count % 15 == 0:
                     # ---------------------------------------------------------
-                    # Tesseract OCR on the tiny cropped image
+                    # Tesseract OCR on the cropped image
                     # ---------------------------------------------------------
-                    # Apply Otsu's thresholding to the tiny crop
-                    _, thresh = cv2.threshold(roi_crop_gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+                    # OCR BUGFIX 1: The 640x480 resolution makes the text too small for Tesseract! 
+                    # We MUST enlarge the crop by 2.5x to give Tesseract HD-level clarity.
+                    zoomed_gray = cv2.resize(roi_crop_gray, None, fx=2.5, fy=2.5, interpolation=cv2.INTER_CUBIC)
+                    
+                    # Apply Otsu's thresholding to create a binary image
+                    _, thresh1 = cv2.threshold(zoomed_gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+                    
+                    # OCR BUGFIX 2: My old auto-inversion logic was tricked by the black laptop/desks in the background!
+                    # Tesseract DEMANDS Black text on White background. 
+                    # We will simply try BOTH (Normal and Inverted) to guarantee it hits!
+                    thresh2 = cv2.bitwise_not(thresh1)
 
-                    # Invert if the background is mostly black (white text)
-                    num_white = cv2.countNonZero(thresh)
-                    num_black = thresh.size - num_white
-                    if num_white < num_black:
-                        thresh = cv2.bitwise_not(thresh)
-
-                    # Perform OCR (Because the image is tiny, this takes ~0.01 seconds instead of 1 second!)
-                    # Whitelist ensures it ONLY guesses math symbols
-                    custom_config = r'--psm 6 -c tessedit_char_whitelist=0123456789+-*/=xX'
-                    text = pytesseract.image_to_string(thresh, config=custom_config)
+                    custom_config = r'--psm 6 -c tessedit_char_whitelist=0123456789+-*/=xX('
+                    
+                    # First try the normal polarity
+                    text = pytesseract.image_to_string(thresh1, config=custom_config)
+                    
+                    # Check if it looks like a math equation at all...
+                    clean_text = text.replace(" ", "").replace("x", "*").replace("X", "*")
+                    if not re.search(r'(\d+[\+\-\*\/]\d+)', clean_text):
+                        # If it found nothing useful, try the inverted polarity!
+                        text = pytesseract.image_to_string(thresh2, config=custom_config)
             else:
                 if self.debug_window and self.cap.isOpened():
                     cv2.imshow("Puzzle Solver Camera Feed", cv_image)
