@@ -16,6 +16,12 @@ class PuzzleSolverNode(Node):
         self.declare_parameter('confirm_threshold', 3) # Number of consecutive identical answers required
         self.declare_parameter('camera_id', 0) # /dev/video0 by default
         
+        # --- New parameters for small distance & screen ---
+        self.declare_parameter('camera_width', 1920)   # Use 1080p if possible for more clarity
+        self.declare_parameter('camera_height', 1080)
+        self.declare_parameter('zoom_factor', 2.0)     # Crop the center 1/2 of the image (ignores the dark room)
+        self.declare_parameter('ocr_scale', 2.0)       # Enlarge the cropped text before OCR
+        
         self.result_topic = self.get_parameter('result_topic').value
         self.debug_window = self.get_parameter('enable_debug_window').value
         self.confirm_threshold = self.get_parameter('confirm_threshold').value
@@ -37,6 +43,12 @@ class PuzzleSolverNode(Node):
         if not self.cap.isOpened():
             self.get_logger().error(f"Failed to open camera /dev/video{self.camera_id}. Check permissions or USB connection.")
             sys.exit(1)
+
+        # Attempt to set high resolution
+        cam_w = self.get_parameter('camera_width').value
+        cam_h = self.get_parameter('camera_height').value
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, cam_w)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cam_h)
 
         # Run timer at ~30Hz (0.033s) for smooth video display
         self.timer = self.create_timer(0.033, self.timer_callback)
@@ -68,24 +80,48 @@ class PuzzleSolverNode(Node):
             self.get_logger().warn("Failed to capture frame from camera.")
             return
 
+        h, w, _ = cv_image.shape
         self.frame_count += 1
 
-        # Draw current confirmation status on the original image if debug window is on
+        # --- Digital Zoom (Crop Center ROI) ---
+        zoom = self.get_parameter('zoom_factor').value
+        if zoom > 1.0:
+            roi_w = int(w / zoom)
+            roi_h = int(h / zoom)
+            x1 = (w - roi_w) // 2
+            y1 = (h - roi_h) // 2
+            roi_image = cv_image[y1:y1+roi_h, x1:x1+roi_w]
+        else:
+            roi_image = cv_image.copy()
+            x1, y1 = 0, 0
+            roi_w, roi_h = w, h
+
+        # Draw current confirmation status and ROI box on the original image
         status_text = f"Confirmations: {self.confirm_count}/{self.confirm_threshold}"
         cv2.putText(cv_image, status_text, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+        cv2.rectangle(cv_image, (x1, y1), (x1+roi_w, y1+roi_h), (0, 255, 0), 2)
         
         # Always display the camera feed smoothly at 30fps
         if self.debug_window and self.cap.isOpened():
             cv2.imshow("Puzzle Solver Camera Feed", cv_image)
+            cv2.imshow("Cropped Screen ROI", roi_image)
             cv2.waitKey(1)
 
         # Only run expensive OCR every 15 frames (~2Hz)
         if self.frame_count % 15 != 0:
             return
 
-        # Preprocessing for Tesseract
-        gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
-        # Apply Otsu's thresholding to handle different brightness levels automatically
+        # --- Enlarge ROI before OCR ---
+        # Tesseract performs poorly on very small text. Scaling up the cropped area helps.
+        scale = self.get_parameter('ocr_scale').value
+        if scale != 1.0:
+            roi_image = cv2.resize(roi_image, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+
+        # Preprocessing for Tesseract on the *cropped ROI*
+        gray = cv2.cvtColor(roi_image, cv2.COLOR_BGR2GRAY)
+        
+        # By using Otsu on the cropped ROI (mostly the bright screen), we avoid the dark background 
+        # of the room skewing the threshold.
         _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
 
         # CRITICAL: Tesseract expects BLACK text on WHITE background!
