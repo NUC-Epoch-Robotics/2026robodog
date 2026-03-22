@@ -17,8 +17,8 @@ class PuzzleSolverNode(Node):
         self.declare_parameter('camera_id', 0) # /dev/video0 by default
         
         # --- New parameters for small distance & screen ---
-        self.declare_parameter('camera_width', 1920)   # Use 1080p if possible for more clarity
-        self.declare_parameter('camera_height', 1080)
+        self.declare_parameter('camera_width', 960)   # Use 1080p if possible for more clarity
+        self.declare_parameter('camera_height', 540)
         self.declare_parameter('zoom_factor', 2.0)     # Crop the center 1/2 of the image (ignores the dark room)
         self.declare_parameter('ocr_scale', 2.0)       # Enlarge the cropped text before OCR
         
@@ -36,6 +36,7 @@ class PuzzleSolverNode(Node):
         self.last_result = None
         self.confirm_count = 0
         self.frame_count = 0
+        self.smoothed_bbox = None  # Add this to smooth the green box
         
         # Open Camera directly
         self.get_logger().info(f"Opening physical camera (ID: {self.camera_id})...")
@@ -93,7 +94,9 @@ class PuzzleSolverNode(Node):
         
         # 1. Blur and binarize to find bright spots (the screen text)
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+        # BUGFIX: Stop using Otsu for the whole room, it causes the threshold to jump randomly and the box to drift!
+        # Instead, we clamp it to > 200, which guarantees we ONLY pick up the bright LED light from the monitor.
+        _, binary = cv2.threshold(blurred, 200, 255, cv2.THRESH_BINARY)
         
         # 2. Use Morphological Close to smear the letters together into one huge white block
         # A 40x10 rectangle kernel will connect characters horizontally
@@ -103,6 +106,8 @@ class PuzzleSolverNode(Node):
         # 3. Find the contours of these huge blocks
         contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
+        text = ""  # Initialize text to empty string to prevent UnboundLocalError
+
         if contours:
             # 4. Grab the largest block (assuming it's the puzzle screen)
             largest_contour = max(contours, key=cv2.contourArea)
@@ -115,12 +120,24 @@ class PuzzleSolverNode(Node):
                 w = min(cv_image.shape[1] - x, w + 2*pad)
                 h = min(cv_image.shape[0] - y, h + 2*pad)
                 
+                # OPTIMIZATION: Temporal Smoothing (EMA) to kill the green box jitter (lock on target)
+                if self.smoothed_bbox is None:
+                    self.smoothed_bbox = [x, y, w, h]
+                else:
+                    alpha = 0.1  # 10% new info, 90% old info (extremely stable)
+                    self.smoothed_bbox[0] = int(alpha * x + (1 - alpha) * self.smoothed_bbox[0])
+                    self.smoothed_bbox[1] = int(alpha * y + (1 - alpha) * self.smoothed_bbox[1])
+                    self.smoothed_bbox[2] = int(alpha * w + (1 - alpha) * self.smoothed_bbox[2])
+                    self.smoothed_bbox[3] = int(alpha * h + (1 - alpha) * self.smoothed_bbox[3])
+
+                sx, sy, sw, sh = self.smoothed_bbox
+
                 # Draw a green box on the video to show exactly what it's cutting out
-                cv2.rectangle(cv_image, (x, y), (x+w, y+h), (0, 255, 0), 2)
-                cv2.putText(cv_image, "ROI", (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.rectangle(cv_image, (sx, sy), (sx+sw, sy+sh), (0, 255, 0), 2)
+                cv2.putText(cv_image, "ROI", (sx, sy-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
                 # 6. Actually CROP the image!
-                roi_crop_gray = gray[y:y+h, x:x+w]
+                roi_crop_gray = gray[sy:sy+sh, sx:sx+sw]
 
                 # Draw current confirmation status
                 status_text = f"Confirmations: {self.confirm_count}/{self.confirm_threshold}"
@@ -150,12 +167,10 @@ class PuzzleSolverNode(Node):
                     custom_config = r'--psm 6 -c tessedit_char_whitelist=0123456789+-*/=xX'
                     text = pytesseract.image_to_string(thresh, config=custom_config)
             else:
-                text = ""
                 if self.debug_window and self.cap.isOpened():
                     cv2.imshow("Puzzle Solver Camera Feed", cv_image)
                     cv2.waitKey(1)
         else:
-            text = ""
             if self.debug_window and self.cap.isOpened():
                 cv2.imshow("Puzzle Solver Camera Feed", cv_image)
                 cv2.waitKey(1)
