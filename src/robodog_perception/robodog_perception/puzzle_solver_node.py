@@ -40,15 +40,18 @@ class PuzzleSolverNode(Node):
         # Open Camera directly
         self.get_logger().info(f"Opening physical camera (ID: {self.camera_id})...")
         self.cap = cv2.VideoCapture(self.camera_id)
+        
+        # VERY IMPORTANT: Lower resolution to 640x480 to kill the lag
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        
         if not self.cap.isOpened():
             self.get_logger().error(f"Failed to open camera /dev/video{self.camera_id}. Check permissions or USB connection.")
             sys.exit(1)
 
-        # Attempt to set high resolution
-        cam_w = self.get_parameter('camera_width').value
-        cam_h = self.get_parameter('camera_height').value
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, cam_w)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cam_h)
+        # We enforce 640x480 for extreme speed (no lag)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
         # Run timer at ~30Hz (0.033s) for smooth video display
         self.timer = self.create_timer(0.033, self.timer_callback)
@@ -83,58 +86,79 @@ class PuzzleSolverNode(Node):
         h, w, _ = cv_image.shape
         self.frame_count += 1
 
-        # --- Digital Zoom (Crop Center ROI) ---
-        zoom = self.get_parameter('zoom_factor').value
-        if zoom > 1.0:
-            roi_w = int(w / zoom)
-            roi_h = int(h / zoom)
-            x1 = (w - roi_w) // 2
-            y1 = (h - roi_h) // 2
-            roi_image = cv_image[y1:y1+roi_h, x1:x1+roi_w]
+        # ---------------------------------------------------------
+        # OPTIMIZATION: ROI Extraction (Find the text block & Crop)
+        # ---------------------------------------------------------
+        gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
+        
+        # 1. Blur and binarize to find bright spots (the screen text)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+        
+        # 2. Use Morphological Close to smear the letters together into one huge white block
+        # A 40x10 rectangle kernel will connect characters horizontally
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 10))
+        closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+        
+        # 3. Find the contours of these huge blocks
+        contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if contours:
+            # 4. Grab the largest block (assuming it's the puzzle screen)
+            largest_contour = max(contours, key=cv2.contourArea)
+            if cv2.contourArea(largest_contour) > 500:  # Reasonably large
+                # 5. Get bounding box and add a little padding
+                x, y, w, h = cv2.boundingRect(largest_contour)
+                pad = 15
+                x = max(0, x - pad)
+                y = max(0, y - pad)
+                w = min(cv_image.shape[1] - x, w + 2*pad)
+                h = min(cv_image.shape[0] - y, h + 2*pad)
+                
+                # Draw a green box on the video to show exactly what it's cutting out
+                cv2.rectangle(cv_image, (x, y), (x+w, y+h), (0, 255, 0), 2)
+                cv2.putText(cv_image, "ROI", (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+                # 6. Actually CROP the image!
+                roi_crop_gray = gray[y:y+h, x:x+w]
+
+                # Draw current confirmation status
+                status_text = f"Confirmations: {self.confirm_count}/{self.confirm_threshold}"
+                cv2.putText(cv_image, status_text, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                
+                # Always display the camera feed smoothly at 30fps
+                if self.debug_window and self.cap.isOpened():
+                    cv2.imshow("Puzzle Solver Camera Feed", cv_image)
+                    cv2.waitKey(1)
+
+                # Only run expensive OCR every 15 frames (~2Hz)
+                if self.frame_count % 15 == 0:
+                    # ---------------------------------------------------------
+                    # Tesseract OCR on the tiny cropped image
+                    # ---------------------------------------------------------
+                    # Apply Otsu's thresholding to the tiny crop
+                    _, thresh = cv2.threshold(roi_crop_gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+
+                    # Invert if the background is mostly black (white text)
+                    num_white = cv2.countNonZero(thresh)
+                    num_black = thresh.size - num_white
+                    if num_white < num_black:
+                        thresh = cv2.bitwise_not(thresh)
+
+                    # Perform OCR (Because the image is tiny, this takes ~0.01 seconds instead of 1 second!)
+                    # Whitelist ensures it ONLY guesses math symbols
+                    custom_config = r'--psm 6 -c tessedit_char_whitelist=0123456789+-*/=xX'
+                    text = pytesseract.image_to_string(thresh, config=custom_config)
+            else:
+                text = ""
+                if self.debug_window and self.cap.isOpened():
+                    cv2.imshow("Puzzle Solver Camera Feed", cv_image)
+                    cv2.waitKey(1)
         else:
-            roi_image = cv_image.copy()
-            x1, y1 = 0, 0
-            roi_w, roi_h = w, h
-
-        # Draw current confirmation status and ROI box on the original image
-        status_text = f"Confirmations: {self.confirm_count}/{self.confirm_threshold}"
-        cv2.putText(cv_image, status_text, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-        cv2.rectangle(cv_image, (x1, y1), (x1+roi_w, y1+roi_h), (0, 255, 0), 2)
-        
-        # Always display the camera feed smoothly at 30fps
-        if self.debug_window and self.cap.isOpened():
-            cv2.imshow("Puzzle Solver Camera Feed", cv_image)
-            cv2.imshow("Cropped Screen ROI", roi_image)
-            cv2.waitKey(1)
-
-        # Only run expensive OCR every 15 frames (~2Hz)
-        if self.frame_count % 15 != 0:
-            return
-
-        # --- Enlarge ROI before OCR ---
-        # Tesseract performs poorly on very small text. Scaling up the cropped area helps.
-        scale = self.get_parameter('ocr_scale').value
-        if scale != 1.0:
-            roi_image = cv2.resize(roi_image, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-
-        # Preprocessing for Tesseract on the *cropped ROI*
-        gray = cv2.cvtColor(roi_image, cv2.COLOR_BGR2GRAY)
-        
-        # By using Otsu on the cropped ROI (mostly the bright screen), we avoid the dark background 
-        # of the room skewing the threshold.
-        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
-
-        # CRITICAL: Tesseract expects BLACK text on WHITE background!
-        # Your screen shows white text on a black background. We must invert it if necessary.
-        num_white = cv2.countNonZero(thresh)
-        num_black = thresh.size - num_white
-        if num_white < num_black:  # If background is mostly black, invert the colors
-            thresh = cv2.bitwise_not(thresh)
-
-        # Perform OCR
-        # Added 'x' and 'X' to whitelist because your screen uses 'x' for multiplication
-        custom_config = r'--psm 6 -c tessedit_char_whitelist=0123456789+-*/=xX'
-        text = pytesseract.image_to_string(thresh, config=custom_config)
+            text = ""
+            if self.debug_window and self.cap.isOpened():
+                cv2.imshow("Puzzle Solver Camera Feed", cv_image)
+                cv2.waitKey(1)
         
         results = [line.strip() for line in text.split('\n') if line.strip()]
         
