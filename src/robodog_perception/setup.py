@@ -20,7 +20,8 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'puzzle_solver_node = robodog_perception.puzzle_solver_node:main'
+            'puzzle_solver_node = robodog_perception.puzzle_solver_node:main',
+            'scene_target_classifier_node = robodog_perception.scene_target_classifier_node:main',
         ],
     },
 )
