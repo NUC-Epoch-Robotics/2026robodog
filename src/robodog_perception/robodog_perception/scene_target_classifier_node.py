@@ -1,16 +1,17 @@
 from pathlib import Path
 from typing import List, Optional, Tuple
+from collections import Counter, deque
+import time
+import os
 
 import cv2
 import numpy as np
 
 import rclpy
 from rclpy.node import Node
+from sensor_msgs.msg import Image
 from std_msgs.msg import Int32
-
-# Camera mode imports are intentionally commented for now (offline image mode).
-# from sensor_msgs.msg import Image
-# from cv_bridge import CvBridge
+from cv_bridge import CvBridge
 
 
 class SceneTargetClassifierNode(Node):
@@ -27,16 +28,28 @@ class SceneTargetClassifierNode(Node):
         super().__init__('scene_target_classifier_node')
 
         # Offline image classification parameters.
+        self.declare_parameter('input_mode', 'ros_image')
         self.declare_parameter('image_dir', '')
         self.declare_parameter('scan_period_sec', 1.0)
         self.declare_parameter('auto_shutdown_after_done', False)
 
         # Camera mode parameter kept for future reuse.
         self.declare_parameter('image_topic', '/camera/image_raw')
+        self.declare_parameter('local_camera_id', 0)
+        self.declare_parameter('auto_select_camera_id', True)
+        self.declare_parameter('camera_probe_max_id', 10)
+        self.declare_parameter('local_camera_width', 640)
+        self.declare_parameter('local_camera_height', 480)
+        self.declare_parameter('process_every_n_frames', 2)
+        self.declare_parameter('consensus_window', 5)
+        self.declare_parameter('consensus_min_votes', 3)
+        self.declare_parameter('publish_cooldown_sec', 0.6)
+        self.declare_parameter('no_frame_warn_sec', 2.0)
+
         self.declare_parameter('result_topic', '/perception/scene_target_result')
         self.declare_parameter('enable_debug_window', True)
-        self.declare_parameter('min_confidence', 0.06)
-        self.declare_parameter('always_publish_best', True)
+        self.declare_parameter('min_confidence', 0.10)
+        self.declare_parameter('always_publish_best', False)
         self.declare_parameter('min_roi_area_ratio', 0.01)
         self.declare_parameter('max_roi_area_ratio', 0.45)
         self.declare_parameter('relative_area_keep_ratio', 0.50)
@@ -44,12 +57,37 @@ class SceneTargetClassifierNode(Node):
         self.declare_parameter('min_white_bg_ratio', 0.32)
         self.declare_parameter('temporal_iou_weight', 0.22)
         self.declare_parameter('enable_center_fallback', False)
+        self.declare_parameter('foreground_bottom_weight', 0.18)
+        self.declare_parameter('use_relaxed_fallback_candidates', True)
+        self.declare_parameter('enable_template_matching', True)
+        self.declare_parameter('template_dir', '')
+        self.declare_parameter('auto_template_from_image_dir', True)
+        self.declare_parameter('templates_per_class', 3)
+        self.declare_parameter('template_weight', 0.12)
+        self.declare_parameter('template_instrument_boost_threshold', 0.55)
+        self.declare_parameter('enable_prediction_guards', True)
+        self.declare_parameter('instrument_min_blue_evi', 0.23)
+        self.declare_parameter('instrument_min_blue_advantage', 0.02)
+        self.declare_parameter('medicine_min_red_evi', 0.20)
+        self.declare_parameter('medicine_blue_rescue_margin', 0.02)
         self.declare_parameter('save_debug_dir', '')
 
+        self.input_mode = str(self.get_parameter('input_mode').value).strip().lower()
         self.image_dir = str(self.get_parameter('image_dir').value)
         self.scan_period_sec = float(self.get_parameter('scan_period_sec').value)
         self.auto_shutdown_after_done = bool(self.get_parameter('auto_shutdown_after_done').value)
         self.image_topic = self.get_parameter('image_topic').value
+        self.local_camera_id = int(self.get_parameter('local_camera_id').value)
+        self.auto_select_camera_id = bool(self.get_parameter('auto_select_camera_id').value)
+        self.camera_probe_max_id = max(0, int(self.get_parameter('camera_probe_max_id').value))
+        self.local_camera_width = int(self.get_parameter('local_camera_width').value)
+        self.local_camera_height = int(self.get_parameter('local_camera_height').value)
+        self.process_every_n_frames = max(1, int(self.get_parameter('process_every_n_frames').value))
+        self.consensus_window = max(1, int(self.get_parameter('consensus_window').value))
+        self.consensus_min_votes = max(1, int(self.get_parameter('consensus_min_votes').value))
+        self.publish_cooldown_sec = float(self.get_parameter('publish_cooldown_sec').value)
+        self.no_frame_warn_sec = float(self.get_parameter('no_frame_warn_sec').value)
+
         self.result_topic = self.get_parameter('result_topic').value
         self.enable_debug_window = self.get_parameter('enable_debug_window').value
         self.min_confidence = float(self.get_parameter('min_confidence').value)
@@ -61,6 +99,21 @@ class SceneTargetClassifierNode(Node):
         self.min_white_bg_ratio = float(self.get_parameter('min_white_bg_ratio').value)
         self.temporal_iou_weight = float(self.get_parameter('temporal_iou_weight').value)
         self.enable_center_fallback = bool(self.get_parameter('enable_center_fallback').value)
+        self.foreground_bottom_weight = float(self.get_parameter('foreground_bottom_weight').value)
+        self.use_relaxed_fallback_candidates = bool(self.get_parameter('use_relaxed_fallback_candidates').value)
+        self.enable_template_matching = bool(self.get_parameter('enable_template_matching').value)
+        self.template_dir = str(self.get_parameter('template_dir').value)
+        self.auto_template_from_image_dir = bool(self.get_parameter('auto_template_from_image_dir').value)
+        self.templates_per_class = int(self.get_parameter('templates_per_class').value)
+        self.template_weight = float(self.get_parameter('template_weight').value)
+        self.template_instrument_boost_threshold = float(
+            self.get_parameter('template_instrument_boost_threshold').value
+        )
+        self.enable_prediction_guards = bool(self.get_parameter('enable_prediction_guards').value)
+        self.instrument_min_blue_evi = float(self.get_parameter('instrument_min_blue_evi').value)
+        self.instrument_min_blue_advantage = float(self.get_parameter('instrument_min_blue_advantage').value)
+        self.medicine_min_red_evi = float(self.get_parameter('medicine_min_red_evi').value)
+        self.medicine_blue_rescue_margin = float(self.get_parameter('medicine_blue_rescue_margin').value)
         self.save_debug_dir = str(self.get_parameter('save_debug_dir').value)
 
         if self.save_debug_dir:
@@ -68,14 +121,21 @@ class SceneTargetClassifierNode(Node):
 
         self.result_pub = self.create_publisher(Int32, self.result_topic, 10)
 
-        # Camera mode subscriber kept as comment for future switch-back.
-        # self.bridge = CvBridge()
-        # self.image_sub = self.create_subscription(Image, self.image_topic, self.image_callback, 10)
+        self.bridge = CvBridge()
+        self.image_sub = None
+        self.cap = None
 
         self.processed_files = set()
         self.empty_rounds = 0
         self.last_quad = None
-        self.timer = self.create_timer(self.scan_period_sec, self.scan_and_process_images)
+        self.timer = None
+        self.frame_counter = 0
+        self.vote_history = deque(maxlen=self.consensus_window)
+        self.last_publish_ts = 0.0
+        self.last_frame_ts = time.monotonic()
+        self.last_no_frame_warn_ts = 0.0
+        self.realtime_timer = None
+        self.heartbeat_timer = None
 
         self.class_names = {
             0: 'food',
@@ -84,14 +144,29 @@ class SceneTargetClassifierNode(Node):
             3: 'medicine',
         }
 
-        if not self.image_dir:
-            self.get_logger().warn('image_dir is empty. Please set image_dir parameter to your picture folder.')
-        else:
+        self.templates = {0: [], 1: [], 2: [], 3: []}
+        self.initialize_templates()
+
+        if self.input_mode == 'ros_image':
+            self.image_sub = self.create_subscription(Image, self.image_topic, self.image_callback, 10)
+            self.heartbeat_timer = self.create_timer(1.0, self.stream_heartbeat_timer_callback)
             self.get_logger().info(
-                f'Offline image mode started. Scan dir: {self.image_dir}, publish: {self.result_topic}'
+                f'Realtime mode started. Subscribe: {self.image_topic}, publish: {self.result_topic}'
+            )
+        elif self.input_mode == 'local_camera':
+            self.start_local_camera()
+        else:
+            # Offline batch path is intentionally disabled for competition realtime usage.
+            # self.timer = self.create_timer(self.scan_period_sec, self.scan_and_process_images)
+            self.get_logger().warn(
+                'input_mode=image_dir is currently disabled. Set input_mode:=ros_image or local_camera.'
             )
 
     def scan_and_process_images(self) -> None:
+        # Legacy offline batch path is disabled for realtime-only runs.
+        return
+
+        # ---- legacy code below (kept for rollback) ----
         if not self.image_dir:
             return
 
@@ -160,7 +235,9 @@ class SceneTargetClassifierNode(Node):
             self.processed_files.add(str(img_path))
 
     def classify_frame(self, frame: np.ndarray) -> Tuple[Optional[int], Optional[float], Optional[np.ndarray]]:
-        candidates = self.extract_candidate_rois(frame)
+        candidates = self.extract_candidate_rois(frame, strict=True)
+        if not candidates and self.use_relaxed_fallback_candidates:
+            candidates = self.extract_candidate_rois(frame, strict=False)
 
         if not candidates:
             return None, None, None
@@ -198,25 +275,156 @@ class SceneTargetClassifierNode(Node):
         self.last_quad = np.array(best['quad']).copy()
         return int(best['class_idx']), float(best['confidence']), best['quad']
 
-    # Camera callback reserved for future camera mode.
-    # def image_callback(self, msg: Image) -> None:
-    #     try:
-    #         frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-    #     except Exception as exc:
-    #         self.get_logger().error(f'Failed to convert ROS Image: {exc}')
-    #         return
-    #
-    #     pred, confidence, quad = self.classify_frame(frame)
-    #     if pred is None or confidence is None:
-    #         self.show_debug(frame, None, None, None)
-    #         return
-    #
-    #     out = Int32()
-    #     out.data = pred
-    #     self.result_pub.publish(out)
-    #     self.show_debug(frame, quad, pred, confidence)
+    def image_callback(self, msg: Image) -> None:
+        try:
+            frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        except Exception as exc:
+            self.get_logger().error(f'Failed to convert ROS Image: {exc}')
+            return
 
-    def extract_candidate_rois(self, frame: np.ndarray) -> List[Tuple[np.ndarray, np.ndarray, float, float]]:
+        self.last_frame_ts = time.monotonic()
+        self.process_live_frame(frame, source='ros_image')
+
+    def start_local_camera(self) -> None:
+        self.log_linux_video_devices()
+        available_ids = self.probe_local_camera_ids(self.camera_probe_max_id)
+        if not available_ids:
+            self.get_logger().error(
+                'No available local camera IDs found. '
+                'Close other apps that occupy camera and check camera permissions.'
+            )
+            return
+
+        selected_id = self.local_camera_id
+        if self.auto_select_camera_id and selected_id not in available_ids:
+            self.get_logger().warn(
+                f'Configured local_camera_id={selected_id} is unavailable. '
+                f'Auto-selecting id={available_ids[0]} from {available_ids}.'
+            )
+            selected_id = available_ids[0]
+
+        if selected_id not in available_ids:
+            self.get_logger().error(
+                f'Failed to open local camera id={selected_id}. Available IDs: {available_ids}. '
+                'Please set local_camera_id to one of available IDs.'
+            )
+            return
+
+        if os.name == 'posix':
+            self.cap = cv2.VideoCapture(selected_id, cv2.CAP_V4L2)
+        else:
+            self.cap = cv2.VideoCapture(selected_id)
+        if self.cap is not None:
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.local_camera_width)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.local_camera_height)
+
+        if self.cap is None or not self.cap.isOpened():
+            self.get_logger().error(
+                f'Failed to open local camera id={selected_id}. Available IDs: {available_ids}.'
+            )
+            return
+
+        self.local_camera_id = selected_id
+
+        self.realtime_timer = self.create_timer(0.033, self.local_camera_timer_callback)
+        self.get_logger().info(
+            f'Local camera opened: id={self.local_camera_id}, '
+            f'requested={self.local_camera_width}x{self.local_camera_height}, publish={self.result_topic}. '
+            f'Available IDs: {available_ids}'
+        )
+
+    def probe_local_camera_ids(self, max_id: int) -> List[int]:
+        available: List[int] = []
+        for cam_id in range(max_id + 1):
+            if os.name == 'posix':
+                cap = cv2.VideoCapture(cam_id, cv2.CAP_V4L2)
+            else:
+                cap = cv2.VideoCapture(cam_id)
+            if cap is None or not cap.isOpened():
+                if cap is not None:
+                    cap.release()
+                continue
+
+            ok, _ = cap.read()
+            cap.release()
+            if ok:
+                available.append(cam_id)
+
+        self.get_logger().info(f'Camera probe result (0..{max_id}): {available}')
+        return available
+
+    def log_linux_video_devices(self) -> None:
+        if os.name != 'posix':
+            return
+
+        dev_nodes = sorted(str(p) for p in Path('/dev').glob('video*'))
+        if dev_nodes:
+            self.get_logger().info(f'Detected video device nodes: {dev_nodes}')
+        else:
+            self.get_logger().warn('No /dev/video* nodes detected on system.')
+
+    def local_camera_timer_callback(self) -> None:
+        if self.cap is None or not self.cap.isOpened():
+            return
+
+        ok, frame = self.cap.read()
+        if not ok or frame is None:
+            now = time.monotonic()
+            if now - self.last_no_frame_warn_ts >= 1.0:
+                self.get_logger().warn('Local camera is opened but no frame received.')
+                self.last_no_frame_warn_ts = now
+            return
+
+        self.last_frame_ts = time.monotonic()
+        self.process_live_frame(frame, source='local_camera')
+
+    def stream_heartbeat_timer_callback(self) -> None:
+        if self.input_mode != 'ros_image':
+            return
+        now = time.monotonic()
+        if now - self.last_frame_ts > self.no_frame_warn_sec:
+            self.get_logger().warn(
+                f'No frames from topic {self.image_topic} for {self.no_frame_warn_sec:.1f}s. '
+                'Check camera node/topic.'
+            )
+
+    def process_live_frame(self, frame: np.ndarray, source: str) -> None:
+        self.frame_counter += 1
+        if self.frame_counter % self.process_every_n_frames != 0:
+            # Always preview current camera frame so user can confirm stream is alive.
+            self.show_debug(frame, None, None, None, f'source={source} preview')
+            return
+
+        pred, confidence, quad = self.classify_frame(frame)
+
+        if pred is not None and confidence is not None and confidence >= self.min_confidence:
+            self.vote_history.append(pred)
+        else:
+            self.vote_history.append(-1)
+
+        valid_votes = [v for v in self.vote_history if v >= 0]
+        vote_text = 'vote=none'
+        winner = None
+        winner_count = 0
+        if valid_votes:
+            winner, winner_count = Counter(valid_votes).most_common(1)[0]
+            vote_text = f'vote={winner} {winner_count}/{self.consensus_window}'
+
+        if winner is not None and winner_count >= self.consensus_min_votes:
+            now = time.monotonic()
+            if now - self.last_publish_ts >= self.publish_cooldown_sec:
+                out = Int32()
+                out.data = int(winner)
+                self.result_pub.publish(out)
+                self.last_publish_ts = now
+                self.get_logger().info(
+                    f'Realtime publish class={winner} ({self.class_names[int(winner)]}), '
+                    f'votes={winner_count}/{self.consensus_window}'
+                )
+
+        self.show_debug(frame, quad, pred, confidence, f'source={source} {vote_text}')
+
+    def extract_candidate_rois(self, frame: np.ndarray, strict: bool = True) -> List[Tuple[np.ndarray, np.ndarray, float, float]]:
         h, w = frame.shape[:2]
         min_area = max(1.0, self.min_roi_area_ratio * float(h * w))
         max_area = max(min_area * 1.5, self.max_roi_area_ratio * float(h * w))
@@ -295,17 +503,38 @@ class SceneTargetClassifierNode(Node):
             icon_hsv = cv2.cvtColor(icon_region, cv2.COLOR_BGR2HSV)
             white_mask = cv2.inRange(icon_hsv, (0, 0, 125), (179, 70, 255))
             white_bg_ratio = float(cv2.countNonZero(white_mask)) / float(max(1, white_mask.size))
-            if white_bg_ratio < self.min_white_bg_ratio:
-                continue
 
             # Area score without fixed-size preference (target distance can change a lot).
             area_ratio = area / float(h * w)
             area_score = max(0.0, min(1.0, (area_ratio - self.min_roi_area_ratio) / area_span))
 
-            if print_score < self.min_print_score:
+            print_threshold = self.min_print_score if strict else (self.min_print_score * 0.55)
+            white_threshold = self.min_white_bg_ratio if strict else (self.min_white_bg_ratio * 0.55)
+
+            if print_score < print_threshold:
                 continue
 
-            roi_score = 0.25 * square_score + 0.25 * extent + 0.20 * print_score + 0.15 * area_score + 0.15 * white_bg_ratio
+            if white_bg_ratio < white_threshold:
+                continue
+
+            # Foreground prior: active target is usually on ground/front area, not high in the background.
+            quad_int = ordered.astype(np.int32)
+            bx, by, bw, bh = cv2.boundingRect(quad_int)
+            cy = by + 0.5 * bh
+            bottom_score = max(0.0, min(1.0, (cy / float(max(1, h)) - 0.20) / 0.80))
+
+            roi_score = (
+                0.22 * square_score
+                + 0.23 * extent
+                + 0.20 * print_score
+                + 0.15 * area_score
+                + 0.10 * white_bg_ratio
+                + self.foreground_bottom_weight * bottom_score
+            )
+
+            if not strict:
+                # Relaxed mode downweights weak-looking rectangles but keeps them for "must detect" behavior.
+                roi_score *= 0.88
 
             candidates.append((ordered.astype(int), warped, roi_score, area_ratio))
 
@@ -352,7 +581,9 @@ class SceneTargetClassifierNode(Node):
 
         # Color masks in HSV.
         green = cv2.inRange(hsv, (30, 35, 25), (105, 255, 255))
-        blue = cv2.inRange(hsv, (85, 35, 25), (145, 255, 255))
+        # Blue is tuned using your measured color (~RGB 2,64,138): broaden around deep azure.
+        blue = cv2.inRange(hsv, (86, 28, 22), (150, 255, 255))
+        deep_blue = cv2.inRange(hsv, (98, 35, 18), (132, 255, 210))
         red1 = cv2.inRange(hsv, (0, 35, 25), (14, 255, 255))
         red2 = cv2.inRange(hsv, (160, 35, 25), (179, 255, 255))
         red = cv2.bitwise_or(red1, red2)
@@ -364,6 +595,7 @@ class SceneTargetClassifierNode(Node):
 
         green_ratio = float(cv2.countNonZero(cv2.bitwise_and(green, ink_mask))) / ink_pixels
         blue_ratio = float(cv2.countNonZero(cv2.bitwise_and(blue, ink_mask))) / ink_pixels
+        deep_blue_ratio = float(cv2.countNonZero(cv2.bitwise_and(deep_blue, ink_mask))) / ink_pixels
         red_ratio = float(cv2.countNonZero(cv2.bitwise_and(red, ink_mask))) / ink_pixels
         gray_ratio = float(cv2.countNonZero(gray_mask)) / ink_pixels
         colorful_ratio = float(cv2.countNonZero(cv2.bitwise_or(cv2.bitwise_or(green, blue), red))) / float(max(1, total))
@@ -404,7 +636,7 @@ class SceneTargetClassifierNode(Node):
         red_ring = float(cv2.countNonZero(cv2.bitwise_and(red, ring_mask))) / ring_total
 
         green_evi = green_ratio + 0.7 * green_dom + 0.25 * green_ring
-        blue_evi = blue_ratio + 0.7 * blue_dom + 0.25 * blue_ring
+        blue_evi = blue_ratio + 0.45 * deep_blue_ratio + 0.7 * blue_dom + 0.25 * blue_ring
         red_evi = red_ratio + 0.7 * red_dom + 0.25 * red_ring
 
         scores = {
@@ -413,6 +645,24 @@ class SceneTargetClassifierNode(Node):
             2: 1.05 * blue_evi + 0.06 * edge_ratio,
             3: 1.05 * red_evi + 0.06 * edge_ratio,
         }
+
+        t_scores = {0: 0.0, 1: 0.0, 2: 0.0, 3: 0.0}
+
+        if self.enable_template_matching:
+            t_scores = self.template_match_scores(roi)
+            for cls_id in scores:
+                scores[cls_id] += self.template_weight * t_scores.get(cls_id, 0.0)
+
+            # Instrument-specific template gate.
+            inst_t = t_scores.get(2, 0.0)
+            other_t = max(t_scores.get(0, 0.0), t_scores.get(1, 0.0), t_scores.get(3, 0.0))
+            if (
+                inst_t > self.template_instrument_boost_threshold
+                and inst_t > other_t + 0.06
+                and blue_evi > max(green_evi, red_evi) + 0.01
+            ):
+                scores[2] += 0.12
+                scores[1] -= 0.08
 
         # If colored evidence is strong, explicitly suppress tools fallback.
         if max(green_evi, blue_evi, red_evi) > 0.28:
@@ -423,7 +673,7 @@ class SceneTargetClassifierNode(Node):
             scores[1] -= 0.20
 
         # Instrument-specific boost: when blue clearly dominates, bias to class 2.
-        if blue_evi > max(green_evi, red_evi) + 0.06 and blue_evi > 0.18:
+        if blue_evi > max(green_evi, red_evi) + 0.05 and blue_evi > 0.16:
             scores[2] += 0.20
             scores[1] -= 0.10
 
@@ -443,11 +693,131 @@ class SceneTargetClassifierNode(Node):
         sorted_items = sorted(scores.items(), key=lambda item: item[1], reverse=True)
         best_idx, best_score = sorted_items[0]
         second_score = sorted_items[1][1]
+
+        if self.enable_prediction_guards:
+            # Guard 1: prevent food/tool from being aggressively over-called as instrument.
+            if best_idx == 2:
+                blue_ok = (
+                    blue_evi >= self.instrument_min_blue_evi
+                    and blue_evi >= (max(green_evi, red_evi) + self.instrument_min_blue_advantage)
+                )
+                if not blue_ok:
+                    # Keep class, but force it to low-confidence so node emits WARN instead of wrong publish.
+                    best_score *= 0.25
+
+            # Guard 2: rescue blue-ish instrument from medicine misclassification.
+            if best_idx == 3:
+                red_weak = red_evi < self.medicine_min_red_evi
+                blue_strong = blue_evi > red_evi + self.medicine_blue_rescue_margin
+                inst_template_not_worse = t_scores.get(2, 0.0) >= (t_scores.get(3, 0.0) - 0.03)
+                if red_weak and blue_strong and inst_template_not_worse:
+                    best_idx = 2
+                    best_score = scores[2]
+                    second_score = max(scores[0], scores[1], scores[3])
+
         margin = max(0.0, best_score - second_score)
         top_norm = min(1.0, max(0.0, best_score) / 1.25)
         confidence = 0.60 * margin + 0.40 * top_norm
 
         return int(best_idx), float(confidence), scores
+
+    def initialize_templates(self) -> None:
+        if not self.enable_template_matching:
+            return
+
+        source_files = []
+
+        if self.template_dir:
+            tdir = Path(self.template_dir)
+            if tdir.exists() and tdir.is_dir():
+                source_files.extend(self.list_image_files(tdir))
+
+        if (not source_files) and self.auto_template_from_image_dir and self.image_dir:
+            idir = Path(self.image_dir)
+            if idir.exists() and idir.is_dir():
+                source_files.extend(self.list_image_files(idir))
+
+        if not source_files:
+            self.get_logger().info('Template matching enabled but no template source found.')
+            return
+
+        counts = {0: 0, 1: 0, 2: 0, 3: 0}
+        for fp in source_files:
+            cls_id = self.infer_class_from_filename(fp.name)
+            if cls_id is None:
+                continue
+            if counts[cls_id] >= self.templates_per_class:
+                continue
+
+            frame = cv2.imread(str(fp))
+            if frame is None:
+                continue
+
+            cands = self.extract_candidate_rois(frame, strict=False)
+            if not cands:
+                continue
+            cands.sort(key=lambda item: item[2], reverse=True)
+            roi = cands[0][1]
+
+            tmpl = self.make_template_feature(roi)
+            if tmpl is None:
+                continue
+
+            self.templates[cls_id].append(tmpl)
+            counts[cls_id] += 1
+
+        total_templates = sum(len(v) for v in self.templates.values())
+        if total_templates > 0:
+            self.get_logger().info(f'Template matching loaded {total_templates} templates: {counts}')
+        else:
+            self.get_logger().info('Template matching enabled, but no valid templates were built.')
+
+    def template_match_scores(self, roi: np.ndarray) -> dict:
+        roi_feat = self.make_template_feature(roi)
+        if roi_feat is None:
+            return {0: 0.0, 1: 0.0, 2: 0.0, 3: 0.0}
+
+        out = {0: 0.0, 1: 0.0, 2: 0.0, 3: 0.0}
+        for cls_id, tmpls in self.templates.items():
+            if not tmpls:
+                continue
+            best = -1.0
+            for t in tmpls:
+                score = cv2.matchTemplate(roi_feat, t, cv2.TM_CCOEFF_NORMED)[0, 0]
+                if score > best:
+                    best = score
+            out[cls_id] = float(max(0.0, best))
+        return out
+
+    @staticmethod
+    def make_template_feature(roi: np.ndarray):
+        if roi is None or roi.size == 0:
+            return None
+        icon = roi[: int(roi.shape[0] * 0.80), :]
+        gray = cv2.cvtColor(icon, cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, (3, 3), 0)
+        _, bw = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+        bw = cv2.morphologyEx(
+            bw,
+            cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+            iterations=1,
+        )
+        feat = cv2.resize(bw, (96, 96), interpolation=cv2.INTER_AREA)
+        return feat
+
+    @staticmethod
+    def infer_class_from_filename(name: str) -> Optional[int]:
+        low = name.lower()
+        if low.startswith('food'):
+            return 0
+        if low.startswith('tool'):
+            return 1
+        if low.startswith('instrument'):
+            return 2
+        if low.startswith('medicine'):
+            return 3
+        return None
 
     @staticmethod
     def gray_world_white_balance(img: np.ndarray) -> np.ndarray:
@@ -499,6 +869,7 @@ class SceneTargetClassifierNode(Node):
         quad: Optional[np.ndarray],
         pred: Optional[int],
         confidence: Optional[float],
+        status_text: Optional[str] = None,
     ) -> None:
         if not self.enable_debug_window:
             return
@@ -511,6 +882,9 @@ class SceneTargetClassifierNode(Node):
         if pred is not None and confidence is not None:
             label = f'pred={pred} {self.class_names[pred]} conf={confidence:.3f}'
             cv2.putText(vis, label, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 220, 255), 2)
+
+        if status_text:
+            cv2.putText(vis, status_text, (20, 62), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 220, 0), 2)
 
         cv2.imshow('Scene Target Classifier', vis)
         cv2.waitKey(1)
@@ -553,6 +927,8 @@ def main(args=None) -> None:
     except KeyboardInterrupt:
         node.get_logger().info('Keyboard interrupt, shutting down.')
     finally:
+        if hasattr(node, 'cap') and node.cap is not None and node.cap.isOpened():
+            node.cap.release()
         cv2.destroyAllWindows()
         node.destroy_node()
         rclpy.shutdown()
