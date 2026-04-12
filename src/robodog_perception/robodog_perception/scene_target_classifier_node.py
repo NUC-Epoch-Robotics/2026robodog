@@ -37,7 +37,7 @@ class SceneTargetClassifierNode(Node):
         self.declare_parameter('enable_debug_window', True)
         self.declare_parameter('min_confidence', 0.08)
         self.declare_parameter('min_roi_area_ratio', 0.01)
-        self.declare_parameter('max_roi_area_ratio', 0.22)
+        self.declare_parameter('max_roi_area_ratio', 0.45)
         self.declare_parameter('save_debug_dir', '')
 
         self.image_dir = str(self.get_parameter('image_dir').value)
@@ -178,6 +178,7 @@ class SceneTargetClassifierNode(Node):
         h, w = frame.shape[:2]
         min_area = max(1.0, self.min_roi_area_ratio * float(h * w))
         max_area = max(min_area * 1.5, self.max_roi_area_ratio * float(h * w))
+        area_span = max(1e-6, self.max_roi_area_ratio - self.min_roi_area_ratio)
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         blur = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -215,13 +216,6 @@ class SceneTargetClassifierNode(Node):
             ratio = bw / float(max(1, bh))
             square_score = max(0.0, 1.0 - abs(1.0 - ratio))
 
-            # Center prior: target is usually near image center area in robot run scenes.
-            cx = x + bw * 0.5
-            cy = y + bh * 0.5
-            dx = abs(cx - (w * 0.5)) / max(1.0, w * 0.5)
-            dy = abs(cy - (h * 0.6)) / max(1.0, h * 0.6)
-            center_score = max(0.0, 1.0 - 0.7 * dx - 0.3 * dy)
-
             # Print density: valid cube face usually contains icon + Chinese text strokes.
             icon_region = warped[: int(warped.shape[0] * 0.9), :]
             icon_gray = cv2.cvtColor(icon_region, cv2.COLOR_BGR2GRAY)
@@ -235,11 +229,11 @@ class SceneTargetClassifierNode(Node):
             ink_ratio = float(cv2.countNonZero(ink_mask)) / float(max(1, ink_mask.size))
             print_score = min(1.0, ink_ratio / 0.22)
 
-            # Area preference around medium-size target; suppress giant wrong quads.
+            # Area score without fixed-size preference (target distance can change a lot).
             area_ratio = area / float(h * w)
-            area_pref = max(0.0, 1.0 - abs(area_ratio - 0.10) / 0.10)
+            area_score = max(0.0, min(1.0, (area_ratio - self.min_roi_area_ratio) / area_span))
 
-            roi_score = 0.35 * square_score + 0.25 * center_score + 0.25 * area_pref + 0.15 * print_score
+            roi_score = 0.45 * square_score + 0.35 * print_score + 0.20 * area_score
 
             candidates.append((ordered.astype(int), warped, roi_score))
 
@@ -255,13 +249,14 @@ class SceneTargetClassifierNode(Node):
             if roi.size > 0:
                 quad = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=int)
                 roi = cv2.resize(roi, (220, 220), interpolation=cv2.INTER_AREA)
-                candidates.append((quad, roi, 0.10))
+                candidates.append((quad, roi, 0.02))
 
         return candidates
 
     def classify_roi(self, roi: np.ndarray):
         # Ignore bottom text area; focus on icon + upper cube faces.
         icon_region = roi[: int(roi.shape[0] * 0.80), :]
+        icon_region = self.gray_world_white_balance(icon_region)
 
         hsv = cv2.cvtColor(icon_region, cv2.COLOR_BGR2HSV)
         gray_img = cv2.cvtColor(icon_region, cv2.COLOR_BGR2GRAY)
@@ -279,10 +274,10 @@ class SceneTargetClassifierNode(Node):
         ink_ratio = ink_pixels / total
 
         # Color masks in HSV.
-        green = cv2.inRange(hsv, (35, 50, 40), (90, 255, 255))
-        blue = cv2.inRange(hsv, (90, 50, 40), (135, 255, 255))
-        red1 = cv2.inRange(hsv, (0, 50, 40), (12, 255, 255))
-        red2 = cv2.inRange(hsv, (165, 50, 40), (179, 255, 255))
+        green = cv2.inRange(hsv, (30, 35, 25), (105, 255, 255))
+        blue = cv2.inRange(hsv, (85, 35, 25), (145, 255, 255))
+        red1 = cv2.inRange(hsv, (0, 35, 25), (14, 255, 255))
+        red2 = cv2.inRange(hsv, (160, 35, 25), (179, 255, 255))
         red = cv2.bitwise_or(red1, red2)
 
         # Tools class uses gray ink; remove bright white background from this mask.
@@ -294,6 +289,24 @@ class SceneTargetClassifierNode(Node):
         blue_ratio = float(cv2.countNonZero(cv2.bitwise_and(blue, ink_mask))) / ink_pixels
         red_ratio = float(cv2.countNonZero(cv2.bitwise_and(red, ink_mask))) / ink_pixels
         gray_ratio = float(cv2.countNonZero(gray_mask)) / ink_pixels
+
+        # Channel-dominance features on ink pixels improve stability under tinted lighting.
+        bgr = icon_region.astype(np.float32)
+        b = bgr[:, :, 0]
+        g = bgr[:, :, 1]
+        r = bgr[:, :, 2]
+        ink_bool = ink_mask > 0
+        if np.any(ink_bool):
+            green_dom = float(np.mean((np.maximum(0.0, g - r) + 0.5 * np.maximum(0.0, g - b))[ink_bool])) / 255.0
+            blue_dom = float(np.mean((np.maximum(0.0, b - r) + 0.5 * np.maximum(0.0, b - g))[ink_bool])) / 255.0
+            red_dom = float(np.mean((np.maximum(0.0, r - g) + 0.5 * np.maximum(0.0, r - b))[ink_bool])) / 255.0
+            chroma = (np.max(bgr, axis=2) - np.min(bgr, axis=2)) / 255.0
+            low_chroma_ratio = float(np.mean((chroma < 0.12)[ink_bool]))
+        else:
+            green_dom = 0.0
+            blue_dom = 0.0
+            red_dom = 0.0
+            low_chroma_ratio = 0.0
 
         # Edge density helps avoid over-trusting weak color cues on blank regions.
         edge = cv2.Canny(gray_img, 80, 180)
@@ -312,17 +325,20 @@ class SceneTargetClassifierNode(Node):
         blue_ring = float(cv2.countNonZero(cv2.bitwise_and(blue, ring_mask))) / ring_total
         red_ring = float(cv2.countNonZero(cv2.bitwise_and(red, ring_mask))) / ring_total
 
+        green_evi = green_ratio + 0.7 * green_dom + 0.25 * green_ring
+        blue_evi = blue_ratio + 0.7 * blue_dom + 0.25 * blue_ring
+        red_evi = red_ratio + 0.7 * red_dom + 0.25 * red_ring
+
         scores = {
-            0: 1.30 * green_ratio + 0.20 * green_ring + 0.08 * edge_ratio,
-            1: 1.10 * gray_ratio + 0.10 * edge_ratio - 0.75 * max(green_ratio, blue_ratio, red_ratio),
-            2: 1.30 * blue_ratio + 0.20 * blue_ring + 0.08 * edge_ratio,
-            3: 1.30 * red_ratio + 0.20 * red_ring + 0.08 * edge_ratio,
+            0: 0.95 * green_evi + 0.10 * edge_ratio,
+            1: 0.75 * gray_ratio + 0.55 * low_chroma_ratio + 0.05 * edge_ratio - 0.85 * max(green_evi, blue_evi, red_evi),
+            2: 0.95 * blue_evi + 0.10 * edge_ratio,
+            3: 0.95 * red_evi + 0.10 * edge_ratio,
         }
 
         # If colored evidence is strong, explicitly suppress tools fallback.
-        max_color = max(green_ratio, blue_ratio, red_ratio)
-        if max_color > 0.22 or (green_ring > 0.05 or blue_ring > 0.05 or red_ring > 0.05):
-            scores[1] -= 0.35
+        if max(green_evi, blue_evi, red_evi) > 0.28:
+            scores[1] -= 0.25
 
         # If almost no print exists, reduce confidence for all classes.
         if ink_ratio < 0.02:
@@ -336,6 +352,15 @@ class SceneTargetClassifierNode(Node):
         confidence = max(0.0, best_score - second_score)
 
         return int(best_idx), float(confidence), scores
+
+    @staticmethod
+    def gray_world_white_balance(img: np.ndarray) -> np.ndarray:
+        imgf = img.astype(np.float32)
+        avg = np.mean(imgf.reshape(-1, 3), axis=0)
+        mean_gray = float(np.mean(avg)) + 1e-6
+        scale = mean_gray / (avg + 1e-6)
+        balanced = imgf * scale.reshape(1, 1, 3)
+        return np.clip(balanced, 0, 255).astype(np.uint8)
 
     @staticmethod
     def order_points(pts: np.ndarray) -> np.ndarray:
