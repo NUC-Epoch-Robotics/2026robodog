@@ -35,9 +35,12 @@ class SceneTargetClassifierNode(Node):
         self.declare_parameter('image_topic', '/camera/image_raw')
         self.declare_parameter('result_topic', '/perception/scene_target_result')
         self.declare_parameter('enable_debug_window', True)
-        self.declare_parameter('min_confidence', 0.08)
+        self.declare_parameter('min_confidence', 0.06)
+        self.declare_parameter('always_publish_best', True)
         self.declare_parameter('min_roi_area_ratio', 0.01)
         self.declare_parameter('max_roi_area_ratio', 0.45)
+        self.declare_parameter('relative_area_keep_ratio', 0.50)
+        self.declare_parameter('min_print_score', 0.08)
         self.declare_parameter('save_debug_dir', '')
 
         self.image_dir = str(self.get_parameter('image_dir').value)
@@ -47,8 +50,11 @@ class SceneTargetClassifierNode(Node):
         self.result_topic = self.get_parameter('result_topic').value
         self.enable_debug_window = self.get_parameter('enable_debug_window').value
         self.min_confidence = float(self.get_parameter('min_confidence').value)
+        self.always_publish_best = bool(self.get_parameter('always_publish_best').value)
         self.min_roi_area_ratio = float(self.get_parameter('min_roi_area_ratio').value)
         self.max_roi_area_ratio = float(self.get_parameter('max_roi_area_ratio').value)
+        self.relative_area_keep_ratio = float(self.get_parameter('relative_area_keep_ratio').value)
+        self.min_print_score = float(self.get_parameter('min_print_score').value)
         self.save_debug_dir = str(self.get_parameter('save_debug_dir').value)
 
         if self.save_debug_dir:
@@ -111,9 +117,18 @@ class SceneTargetClassifierNode(Node):
 
             pred, confidence, quad = self.classify_frame(frame)
 
-            if pred is None or confidence < self.min_confidence:
+            if pred is None:
                 self.get_logger().warn(
-                    f'{img_path.name}: target not confident enough, conf={confidence if confidence is not None else 0.0:.3f}'
+                    f'{img_path.name}: target not found.'
+                )
+                self.show_debug(frame, quad, pred, confidence)
+                self.save_debug_image(frame, img_path.name, quad, pred, confidence)
+                self.processed_files.add(str(img_path))
+                continue
+
+            if confidence < self.min_confidence and not self.always_publish_best:
+                self.get_logger().warn(
+                    f'{img_path.name}: target not confident enough, conf={confidence:.3f}'
                 )
                 self.show_debug(frame, quad, pred, confidence)
                 self.save_debug_image(frame, img_path.name, quad, pred, confidence)
@@ -124,9 +139,14 @@ class SceneTargetClassifierNode(Node):
             out.data = pred
             self.result_pub.publish(out)
 
-            self.get_logger().info(
-                f'{img_path.name} -> class={pred} ({self.class_names[pred]}), conf={confidence:.3f}'
-            )
+            if confidence < self.min_confidence:
+                self.get_logger().warn(
+                    f'{img_path.name} -> low-confidence class={pred} ({self.class_names[pred]}), conf={confidence:.3f}'
+                )
+            else:
+                self.get_logger().info(
+                    f'{img_path.name} -> class={pred} ({self.class_names[pred]}), conf={confidence:.3f}'
+                )
 
             self.show_debug(frame, quad, pred, confidence)
             self.save_debug_image(frame, img_path.name, quad, pred, confidence)
@@ -138,10 +158,18 @@ class SceneTargetClassifierNode(Node):
         if not candidates:
             return None, None, None
 
+        # Keep candidates close to the largest visible square target to suppress small side boxes.
+        max_area_ratio = max(item[3] for item in candidates)
+        area_threshold = max_area_ratio * max(0.0, min(1.0, self.relative_area_keep_ratio))
+        filtered = [item for item in candidates if item[3] >= area_threshold]
+        if not filtered:
+            filtered = candidates
+
         best = None
-        for quad, roi, roi_score in candidates:
+        for quad, roi, roi_score, area_ratio in filtered:
             cls_idx, cls_conf, cls_scores = self.classify_roi(roi)
-            fused_conf = 0.8 * cls_conf + 0.2 * roi_score
+            # Favor both classification confidence and geometrically reliable ROI.
+            fused_conf = 0.75 * cls_conf + 0.25 * roi_score
 
             if best is None or fused_conf > best['confidence']:
                 best = {
@@ -149,6 +177,7 @@ class SceneTargetClassifierNode(Node):
                     'confidence': fused_conf,
                     'scores': cls_scores,
                     'quad': quad,
+                    'area_ratio': area_ratio,
                 }
 
         if best is None:
@@ -174,7 +203,7 @@ class SceneTargetClassifierNode(Node):
     #     self.result_pub.publish(out)
     #     self.show_debug(frame, quad, pred, confidence)
 
-    def extract_candidate_rois(self, frame: np.ndarray) -> List[Tuple[np.ndarray, np.ndarray, float]]:
+    def extract_candidate_rois(self, frame: np.ndarray) -> List[Tuple[np.ndarray, np.ndarray, float, float]]:
         h, w = frame.shape[:2]
         min_area = max(1.0, self.min_roi_area_ratio * float(h * w))
         max_area = max(min_area * 1.5, self.max_roi_area_ratio * float(h * w))
@@ -182,12 +211,25 @@ class SceneTargetClassifierNode(Node):
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         blur = cv2.GaussianBlur(gray, (5, 5), 0)
-        edges = cv2.Canny(blur, 60, 180)
+        norm = cv2.equalizeHist(blur)
+        edges = cv2.Canny(norm, 45, 150)
+
+        adaptive = cv2.adaptiveThreshold(
+            norm,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            35,
+            4,
+        )
+        adaptive = cv2.bitwise_not(adaptive)
+        edges = cv2.bitwise_or(edges, adaptive)
 
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
         edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
+        edges = cv2.morphologyEx(edges, cv2.MORPH_OPEN, kernel, iterations=1)
 
-        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
         candidates = []
 
         for cnt in contours:
@@ -195,13 +237,22 @@ class SceneTargetClassifierNode(Node):
             if area < min_area or area > max_area:
                 continue
 
-            peri = cv2.arcLength(cnt, True)
-            approx = cv2.approxPolyDP(cnt, 0.03 * peri, True)
-            if len(approx) != 4 or not cv2.isContourConvex(approx):
+            rect = cv2.minAreaRect(cnt)
+            rw, rh = rect[1]
+            if rw < 25 or rh < 25:
                 continue
 
-            quad = approx.reshape(4, 2).astype(np.float32)
-            ordered = self.order_points(quad)
+            ratio = max(rw, rh) / float(max(1.0, min(rw, rh)))
+            if ratio > 1.45:
+                continue
+
+            rect_area = float(max(1.0, rw * rh))
+            extent = area / rect_area
+            if extent < 0.55:
+                continue
+
+            box = cv2.boxPoints(rect).astype(np.float32)
+            ordered = self.order_points(box)
 
             warp_size = 220
             dst = np.array(
@@ -211,9 +262,7 @@ class SceneTargetClassifierNode(Node):
             mat = cv2.getPerspectiveTransform(ordered, dst)
             warped = cv2.warpPerspective(frame, mat, (warp_size, warp_size))
 
-            # Prefer near-square, larger quads.
-            x, y, bw, bh = cv2.boundingRect(approx)
-            ratio = bw / float(max(1, bh))
+            # Prefer near-square, high-extent quads and valid print density.
             square_score = max(0.0, 1.0 - abs(1.0 - ratio))
 
             # Print density: valid cube face usually contains icon + Chinese text strokes.
@@ -233,9 +282,16 @@ class SceneTargetClassifierNode(Node):
             area_ratio = area / float(h * w)
             area_score = max(0.0, min(1.0, (area_ratio - self.min_roi_area_ratio) / area_span))
 
-            roi_score = 0.45 * square_score + 0.35 * print_score + 0.20 * area_score
+            if print_score < self.min_print_score:
+                continue
 
-            candidates.append((ordered.astype(int), warped, roi_score))
+            roi_score = 0.35 * square_score + 0.35 * extent + 0.20 * print_score + 0.10 * area_score
+
+            candidates.append((ordered.astype(int), warped, roi_score, area_ratio))
+
+        if candidates:
+            candidates.sort(key=lambda item: item[2], reverse=True)
+            candidates = candidates[:8]
 
         # Fallback: if no square-like contour is found, use a smaller center crop.
         if not candidates:
@@ -249,7 +305,8 @@ class SceneTargetClassifierNode(Node):
             if roi.size > 0:
                 quad = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=int)
                 roi = cv2.resize(roi, (220, 220), interpolation=cv2.INTER_AREA)
-                candidates.append((quad, roi, 0.02))
+                area_ratio = float((x2 - x1) * (y2 - y1)) / float(max(1, h * w))
+                candidates.append((quad, roi, 0.02, area_ratio))
 
         return candidates
 
@@ -289,6 +346,7 @@ class SceneTargetClassifierNode(Node):
         blue_ratio = float(cv2.countNonZero(cv2.bitwise_and(blue, ink_mask))) / ink_pixels
         red_ratio = float(cv2.countNonZero(cv2.bitwise_and(red, ink_mask))) / ink_pixels
         gray_ratio = float(cv2.countNonZero(gray_mask)) / ink_pixels
+        colorful_ratio = float(cv2.countNonZero(cv2.bitwise_or(cv2.bitwise_or(green, blue), red))) / float(max(1, total))
 
         # Channel-dominance features on ink pixels improve stability under tinted lighting.
         bgr = icon_region.astype(np.float32)
@@ -330,26 +388,37 @@ class SceneTargetClassifierNode(Node):
         red_evi = red_ratio + 0.7 * red_dom + 0.25 * red_ring
 
         scores = {
-            0: 0.95 * green_evi + 0.10 * edge_ratio,
-            1: 0.75 * gray_ratio + 0.55 * low_chroma_ratio + 0.05 * edge_ratio - 0.85 * max(green_evi, blue_evi, red_evi),
-            2: 0.95 * blue_evi + 0.10 * edge_ratio,
-            3: 0.95 * red_evi + 0.10 * edge_ratio,
+            0: 1.05 * green_evi + 0.06 * edge_ratio,
+            1: 0.85 * gray_ratio + 0.55 * low_chroma_ratio + 0.05 * edge_ratio - 0.90 * max(green_evi, blue_evi, red_evi),
+            2: 1.05 * blue_evi + 0.06 * edge_ratio,
+            3: 1.05 * red_evi + 0.06 * edge_ratio,
         }
 
         # If colored evidence is strong, explicitly suppress tools fallback.
         if max(green_evi, blue_evi, red_evi) > 0.28:
             scores[1] -= 0.25
 
+        # Strong color dominance should force non-tools classes.
+        if colorful_ratio > 0.06 and max(green_evi, blue_evi, red_evi) > 0.20:
+            scores[1] -= 0.20
+
+        # Instrument-specific boost: when blue clearly dominates, bias to class 2.
+        if blue_evi > max(green_evi, red_evi) + 0.06 and blue_evi > 0.18:
+            scores[2] += 0.20
+            scores[1] -= 0.10
+
         # If almost no print exists, reduce confidence for all classes.
         if ink_ratio < 0.02:
             for k in scores:
                 scores[k] *= 0.6
 
-        # Use margin between top-1 and top-2 as confidence.
+        # Confidence combines margin and top score to avoid frequent "not confident" on hard frames.
         sorted_items = sorted(scores.items(), key=lambda item: item[1], reverse=True)
         best_idx, best_score = sorted_items[0]
         second_score = sorted_items[1][1]
-        confidence = max(0.0, best_score - second_score)
+        margin = max(0.0, best_score - second_score)
+        top_norm = min(1.0, max(0.0, best_score) / 1.25)
+        confidence = 0.60 * margin + 0.40 * top_norm
 
         return int(best_idx), float(confidence), scores
 
