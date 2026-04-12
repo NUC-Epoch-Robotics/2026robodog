@@ -41,6 +41,9 @@ class SceneTargetClassifierNode(Node):
         self.declare_parameter('max_roi_area_ratio', 0.45)
         self.declare_parameter('relative_area_keep_ratio', 0.50)
         self.declare_parameter('min_print_score', 0.08)
+        self.declare_parameter('min_white_bg_ratio', 0.32)
+        self.declare_parameter('temporal_iou_weight', 0.22)
+        self.declare_parameter('enable_center_fallback', False)
         self.declare_parameter('save_debug_dir', '')
 
         self.image_dir = str(self.get_parameter('image_dir').value)
@@ -55,6 +58,9 @@ class SceneTargetClassifierNode(Node):
         self.max_roi_area_ratio = float(self.get_parameter('max_roi_area_ratio').value)
         self.relative_area_keep_ratio = float(self.get_parameter('relative_area_keep_ratio').value)
         self.min_print_score = float(self.get_parameter('min_print_score').value)
+        self.min_white_bg_ratio = float(self.get_parameter('min_white_bg_ratio').value)
+        self.temporal_iou_weight = float(self.get_parameter('temporal_iou_weight').value)
+        self.enable_center_fallback = bool(self.get_parameter('enable_center_fallback').value)
         self.save_debug_dir = str(self.get_parameter('save_debug_dir').value)
 
         if self.save_debug_dir:
@@ -68,6 +74,7 @@ class SceneTargetClassifierNode(Node):
 
         self.processed_files = set()
         self.empty_rounds = 0
+        self.last_quad = None
         self.timer = self.create_timer(self.scan_period_sec, self.scan_and_process_images)
 
         self.class_names = {
@@ -167,9 +174,14 @@ class SceneTargetClassifierNode(Node):
 
         best = None
         for quad, roi, roi_score, area_ratio in filtered:
+            temporal_bonus = 0.0
+            if self.last_quad is not None:
+                temporal_bonus = self.quad_iou(np.array(quad), np.array(self.last_quad)) * self.temporal_iou_weight
+
+            stabilized_roi_score = roi_score + temporal_bonus
             cls_idx, cls_conf, cls_scores = self.classify_roi(roi)
             # Favor both classification confidence and geometrically reliable ROI.
-            fused_conf = 0.75 * cls_conf + 0.25 * roi_score
+            fused_conf = 0.75 * cls_conf + 0.25 * stabilized_roi_score
 
             if best is None or fused_conf > best['confidence']:
                 best = {
@@ -183,6 +195,7 @@ class SceneTargetClassifierNode(Node):
         if best is None:
             return None, None, None
 
+        self.last_quad = np.array(best['quad']).copy()
         return int(best['class_idx']), float(best['confidence']), best['quad']
 
     # Camera callback reserved for future camera mode.
@@ -278,6 +291,13 @@ class SceneTargetClassifierNode(Node):
             ink_ratio = float(cv2.countNonZero(ink_mask)) / float(max(1, ink_mask.size))
             print_score = min(1.0, ink_ratio / 0.22)
 
+            # White-board prior: target face is mostly white background with printed icon/text.
+            icon_hsv = cv2.cvtColor(icon_region, cv2.COLOR_BGR2HSV)
+            white_mask = cv2.inRange(icon_hsv, (0, 0, 125), (179, 70, 255))
+            white_bg_ratio = float(cv2.countNonZero(white_mask)) / float(max(1, white_mask.size))
+            if white_bg_ratio < self.min_white_bg_ratio:
+                continue
+
             # Area score without fixed-size preference (target distance can change a lot).
             area_ratio = area / float(h * w)
             area_score = max(0.0, min(1.0, (area_ratio - self.min_roi_area_ratio) / area_span))
@@ -285,7 +305,7 @@ class SceneTargetClassifierNode(Node):
             if print_score < self.min_print_score:
                 continue
 
-            roi_score = 0.35 * square_score + 0.35 * extent + 0.20 * print_score + 0.10 * area_score
+            roi_score = 0.25 * square_score + 0.25 * extent + 0.20 * print_score + 0.15 * area_score + 0.15 * white_bg_ratio
 
             candidates.append((ordered.astype(int), warped, roi_score, area_ratio))
 
@@ -293,8 +313,8 @@ class SceneTargetClassifierNode(Node):
             candidates.sort(key=lambda item: item[2], reverse=True)
             candidates = candidates[:8]
 
-        # Fallback: if no square-like contour is found, use a smaller center crop.
-        if not candidates:
+        # Optional fallback: when enabled, use center crop to avoid returning no target.
+        if not candidates and self.enable_center_fallback:
             size = int(min(h, w) * 0.35)
             cx, cy = w // 2, h // 2
             x1 = max(0, cx - size // 2)
@@ -407,6 +427,13 @@ class SceneTargetClassifierNode(Node):
             scores[2] += 0.20
             scores[1] -= 0.10
 
+        # Direct blue-vs-green disambiguation for instrument vs food.
+        if blue_evi > green_evi + 0.04:
+            scores[2] += 0.12
+            scores[0] -= 0.08
+        elif green_evi > blue_evi + 0.04:
+            scores[0] += 0.12
+
         # If almost no print exists, reduce confidence for all classes.
         if ink_ratio < 0.02:
             for k in scores:
@@ -430,6 +457,28 @@ class SceneTargetClassifierNode(Node):
         scale = mean_gray / (avg + 1e-6)
         balanced = imgf * scale.reshape(1, 1, 3)
         return np.clip(balanced, 0, 255).astype(np.uint8)
+
+    @staticmethod
+    def quad_iou(quad_a: np.ndarray, quad_b: np.ndarray) -> float:
+        ax1, ay1, aw, ah = cv2.boundingRect(quad_a.astype(np.int32))
+        bx1, by1, bw, bh = cv2.boundingRect(quad_b.astype(np.int32))
+        ax2, ay2 = ax1 + aw, ay1 + ah
+        bx2, by2 = bx1 + bw, by1 + bh
+
+        inter_x1 = max(ax1, bx1)
+        inter_y1 = max(ay1, by1)
+        inter_x2 = min(ax2, bx2)
+        inter_y2 = min(ay2, by2)
+        inter_w = max(0, inter_x2 - inter_x1)
+        inter_h = max(0, inter_y2 - inter_y1)
+        inter = float(inter_w * inter_h)
+
+        area_a = float(max(1, aw * ah))
+        area_b = float(max(1, bw * bh))
+        union = area_a + area_b - inter
+        if union <= 0:
+            return 0.0
+        return inter / union
 
     @staticmethod
     def order_points(pts: np.ndarray) -> np.ndarray:
